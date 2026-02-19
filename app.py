@@ -38,6 +38,11 @@ class RealSenseCameraApp:
         )
         self.capture_btn.pack(side=tk.LEFT, padx=5)
 
+        self.name_label = tk.Label(btn_frame, text="File name:")
+        self.name_label.pack(side=tk.LEFT, padx=(10, 4))
+        self.name_entry = tk.Entry(btn_frame, width=24)
+        self.name_entry.pack(side=tk.LEFT, padx=4)
+
         self.quit_btn = tk.Button(btn_frame, text="Quit (ESC)", command=self.close)
         self.quit_btn.pack(side=tk.LEFT, padx=5)
 
@@ -124,10 +129,34 @@ class RealSenseCameraApp:
         if self.last_frame is None:
             return
 
-        filename = os.path.join(self.save_dir, f"img_{self.counter:05d}.jpg")
+        base_name = self.name_entry.get().strip()
+        if not base_name:
+            filename = self._next_default_filename()
+        else:
+            filename = self._unique_filename(base_name, ext=".jpg")
         cv2.imwrite(filename, self.last_frame)
         self.status.configure(text=f"Saved: {filename} | backend: {self.backend}")
+
+    def _next_default_filename(self):
+        filename = os.path.join(self.save_dir, f"img_{self.counter:05d}.jpg")
+        while os.path.exists(filename):
+            self.counter += 1
+            filename = os.path.join(self.save_dir, f"img_{self.counter:05d}.jpg")
         self.counter += 1
+        return filename
+
+    def _unique_filename(self, base_name, ext=".jpg"):
+        base_name = os.path.basename(base_name)
+        if base_name.lower().endswith(ext):
+            base_name = base_name[: -len(ext)]
+        base_name = base_name.strip() or "img"
+
+        candidate = os.path.join(self.save_dir, f"{base_name}{ext}")
+        suffix = 1
+        while os.path.exists(candidate):
+            candidate = os.path.join(self.save_dir, f"{base_name}_{suffix}{ext}")
+            suffix += 1
+        return candidate
 
     def close(self):
         self.running = False
