@@ -25,6 +25,7 @@ class RealSenseCameraApp:
 
         # Filename counter
         self.counter = self._next_index(self.save_dir, prefix="img_", ext=".jpg")
+        self.capture_count = 0
 
         # UI
         self.image_label = tk.Label(root)
@@ -46,8 +47,15 @@ class RealSenseCameraApp:
         self.quit_btn = tk.Button(btn_frame, text="Quit (ESC)", command=self.close)
         self.quit_btn.pack(side=tk.LEFT, padx=5)
 
+        self.reset_btn = tk.Button(
+            btn_frame, text="Reset Counter", command=self.reset_counter
+        )
+        self.reset_btn.pack(side=tk.LEFT, padx=5)
+
         self.status = tk.Label(root, text=f"Saving to: {self.save_dir}")
         self.status.pack(padx=10, pady=5)
+        self.counter_label = tk.Label(root, text=f"Captured this session: {self.capture_count}")
+        self.counter_label.pack(padx=10, pady=(0, 5))
         self.stream_info = tk.Label(root, text="Stream: initializing...")
         self.stream_info.pack(padx=10, pady=(0, 8))
 
@@ -134,8 +142,18 @@ class RealSenseCameraApp:
             filename = self._next_default_filename()
         else:
             filename = self._unique_filename(base_name, ext=".jpg")
-        cv2.imwrite(filename, self.last_frame)
-        self.status.configure(text=f"Saved: {filename} | backend: {self.backend}")
+        if cv2.imwrite(filename, self.last_frame):
+            self.capture_count += 1
+            self.counter_label.configure(
+                text=f"Captured this session: {self.capture_count}"
+            )
+            self.status.configure(text=f"Saved: {filename} | backend: {self.backend}")
+        else:
+            self.status.configure(text=f"Failed to save: {filename} | backend: {self.backend}")
+
+    def reset_counter(self):
+        self.capture_count = 0
+        self.counter_label.configure(text=f"Captured this session: {self.capture_count}")
 
     def _next_default_filename(self):
         filename = os.path.join(self.save_dir, f"img_{self.counter:05d}.jpg")
