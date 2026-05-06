@@ -1,16 +1,37 @@
 import os
 import subprocess
 import sys
+import threading
 import cv2
 import numpy as np
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from PIL import Image, ImageTk
 
 try:
     import pyrealsense2 as rs
 except ModuleNotFoundError:
     rs = None
+
+try:
+    import rclpy
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.node import Node
+except ModuleNotFoundError:
+    rclpy = None
+    SingleThreadedExecutor = None
+    Node = None
+
+try:
+    from sensor_msgs.msg import CompressedImage, Image as RosImage
+except ModuleNotFoundError:
+    RosImage = None
+    CompressedImage = None
+
+try:
+    from cv_bridge import CvBridge
+except ModuleNotFoundError:
+    CvBridge = None
 
 
 class RealSenseCameraApp:
@@ -78,6 +99,15 @@ class RealSenseCameraApp:
         self.realsense_device_serial = None
         self.cap = None
         self.opencv_index = None
+        self.ros_executor = None
+        self.ros_node = None
+        self.ros_thread = None
+        self.ros_topic_name = None
+        self.ros_topic_type = None
+        self.ros_bridge = CvBridge() if CvBridge is not None else None
+        self.ros_latest_frame = None
+        self.ros_frame_lock = threading.Lock()
+        self.ros_shutdown_event = threading.Event()
         self.camera_source_id = None
         self.device_label_text = "Device: (none)"
 
@@ -108,6 +138,27 @@ class RealSenseCameraApp:
                 "label": "Auto (OpenCV only)",
             },
         ]
+
+        for topic in self._ros2_image_topics():
+            name = topic["name"]
+            type_name = topic["type"]
+            sources.append(
+                {
+                    "id": f"ros2:{name}:{type_name}",
+                    "kind": "ros2",
+                    "topic": name,
+                    "topic_type": type_name,
+                    "label": f"ROS 2: {name} [{type_name}]",
+                }
+            )
+        if rclpy is not None:
+            sources.append(
+                {
+                    "id": "ros2:manual",
+                    "kind": "ros2_manual",
+                    "label": "ROS 2: Enter topic manually...",
+                }
+            )
 
         for dev in self._realsense_devices():
             serial = dev.get("serial")
@@ -227,6 +278,28 @@ class RealSenseCameraApp:
         self.cap = None
         self.opencv_index = None
 
+        self.ros_shutdown_event.set()
+        try:
+            if self.ros_executor is not None:
+                self.ros_executor.shutdown()
+        except Exception:
+            pass
+        if self.ros_thread is not None and self.ros_thread.is_alive():
+            self.ros_thread.join(timeout=1.0)
+        try:
+            if self.ros_node is not None:
+                self.ros_node.destroy_node()
+        except Exception:
+            pass
+        self.ros_executor = None
+        self.ros_node = None
+        self.ros_thread = None
+        self.ros_topic_name = None
+        self.ros_topic_type = None
+        with self.ros_frame_lock:
+            self.ros_latest_frame = None
+        self.ros_shutdown_event = threading.Event()
+
         self.backend = None
         self.camera_source_id = None
         self.last_frame = None
@@ -274,6 +347,17 @@ class RealSenseCameraApp:
 
         if kind == "opencv":
             self._start_opencv_index(source["index"])
+            return
+
+        if kind == "ros2":
+            self._start_ros2_topic(source["topic"], source["topic_type"])
+            return
+
+        if kind == "ros2_manual":
+            manual = self._prompt_ros2_topic_details()
+            if manual is None:
+                raise RuntimeError("ROS 2 topic selection was cancelled.")
+            self._start_ros2_topic(manual["topic"], manual["topic_type"])
             return
 
         raise RuntimeError(f"Unknown camera source kind: {kind}")
@@ -354,6 +438,99 @@ class RealSenseCameraApp:
             )
         return devices
 
+    def _ensure_ros2_initialized(self):
+        if (
+            rclpy is None
+            or Node is None
+            or SingleThreadedExecutor is None
+            or RosImage is None
+            or CompressedImage is None
+        ):
+            raise RuntimeError(
+                "ROS 2 Python packages are not available. Source your ROS 2 environment before starting the app."
+            )
+
+        if not rclpy.ok():
+            rclpy.init(args=None)
+
+    def _ros2_image_topics(self):
+        if rclpy is None:
+            return []
+
+        try:
+            self._ensure_ros2_initialized()
+        except Exception:
+            return []
+
+        node = None
+        executor = None
+        try:
+            node = Node("camera_capture_app_discovery")
+            executor = SingleThreadedExecutor()
+            executor.add_node(node)
+            for _ in range(3):
+                executor.spin_once(timeout_sec=0.1)
+
+            topics = []
+            seen = set()
+            valid_types = {
+                "sensor_msgs/msg/Image",
+                "sensor_msgs/msg/CompressedImage",
+            }
+            for name, type_names in node.get_topic_names_and_types():
+                for type_name in type_names:
+                    if type_name not in valid_types:
+                        continue
+                    key = (name, type_name)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    topics.append({"name": name, "type": type_name})
+            topics.sort(key=lambda item: (item["name"], item["type"]))
+            return topics
+        except Exception:
+            return []
+        finally:
+            if executor is not None:
+                try:
+                    executor.shutdown()
+                except Exception:
+                    pass
+            if node is not None:
+                try:
+                    node.destroy_node()
+                except Exception:
+                    pass
+
+    def _prompt_ros2_topic_details(self):
+        topic_name = simpledialog.askstring(
+            "ROS 2 Topic",
+            "Enter ROS 2 topic name:",
+            initialvalue="/realsense_cam/color/image_raw",
+            parent=self.root,
+        )
+        if topic_name is None:
+            return None
+
+        topic_name = topic_name.strip()
+        if not topic_name:
+            raise RuntimeError("ROS 2 topic name cannot be empty.")
+
+        topic_type = simpledialog.askstring(
+            "ROS 2 Topic Type",
+            "Enter ROS 2 topic type:\nUse `sensor_msgs/msg/Image` or `sensor_msgs/msg/CompressedImage`.",
+            initialvalue="sensor_msgs/msg/Image",
+            parent=self.root,
+        )
+        if topic_type is None:
+            return None
+
+        topic_type = topic_type.strip()
+        if topic_type not in {"sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage"}:
+            raise RuntimeError(f"Unsupported ROS 2 image topic type: {topic_type}")
+
+        return {"topic": topic_name, "topic_type": topic_type}
+
     def _linux_v4l2_devices(self):
         sys_path = "/sys/class/video4linux"
         if not os.path.isdir(sys_path):
@@ -412,6 +589,22 @@ class RealSenseCameraApp:
             if ok and frame is not None:
                 indices.append(idx)
         return indices
+
+    def _frame_color_score(self, frame):
+        if frame is None or len(frame.shape) != 3 or frame.shape[2] < 3:
+            return -1000.0
+
+        b = frame[:, :, 0].astype(np.float32)
+        g = frame[:, :, 1].astype(np.float32)
+        r = frame[:, :, 2].astype(np.float32)
+
+        # Infrared/depth-like nodes usually have nearly identical color channels.
+        color_delta = float(
+            np.mean(np.abs(r - g)) + np.mean(np.abs(g - b)) + np.mean(np.abs(r - b))
+        )
+        brightness = float(np.mean(frame))
+        contrast = float(np.std(frame))
+        return color_delta * 10.0 + contrast + min(brightness, 64.0) * 0.1
 
     def _next_index(self, folder, prefix="img_", ext=".jpg"):
         max_i = -1
@@ -492,6 +685,11 @@ class RealSenseCameraApp:
     def close(self):
         self.running = False
         self._stop_camera()
+        if rclpy is not None and rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
         self.root.destroy()
 
     def _start_realsense(self, serial=None):
@@ -499,14 +697,14 @@ class RealSenseCameraApp:
             raise RuntimeError("pyrealsense2 is not installed.")
 
         attempts = [
-            (1280, 720, 30, rs.format.bgr8),
-            (1280, 720, 30, rs.format.rgb8),
             (640, 480, 30, rs.format.bgr8),
             (640, 480, 30, rs.format.rgb8),
-            (1280, 720, 15, rs.format.bgr8),
-            (1280, 720, 15, rs.format.rgb8),
+            (1280, 720, 30, rs.format.bgr8),
+            (1280, 720, 30, rs.format.rgb8),
             (640, 480, 15, rs.format.bgr8),
             (640, 480, 15, rs.format.rgb8),
+            (1280, 720, 15, rs.format.bgr8),
+            (1280, 720, 15, rs.format.rgb8),
         ]
 
         last_exc = None
@@ -578,13 +776,74 @@ class RealSenseCameraApp:
             ok, frame = self.cap.read()
             if ok and frame is not None:
                 return frame
+
+        if self.backend == "ros2":
+            with self.ros_frame_lock:
+                if self.ros_latest_frame is None:
+                    return None
+                return self.ros_latest_frame.copy()
         return None
+
+    def _start_ros2_topic(self, topic_name, topic_type):
+        self._ensure_ros2_initialized()
+
+        if self.ros_bridge is None:
+            raise RuntimeError(
+                "`cv_bridge` is not available. Install the ROS 2 cv_bridge package to use ROS image topics."
+            )
+
+        topic_cls = None
+        if topic_type == "sensor_msgs/msg/Image":
+            topic_cls = RosImage
+        elif topic_type == "sensor_msgs/msg/CompressedImage":
+            topic_cls = CompressedImage
+        else:
+            raise RuntimeError(f"Unsupported ROS 2 image topic type: {topic_type}")
+
+        self.ros_shutdown_event.clear()
+        self.ros_node = Node("camera_capture_app_subscriber")
+        self.ros_executor = SingleThreadedExecutor()
+        self.ros_executor.add_node(self.ros_node)
+
+        def on_image(msg):
+            try:
+                if topic_type == "sensor_msgs/msg/Image":
+                    frame = self.ros_bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+                else:
+                    compressed = np.frombuffer(msg.data, dtype=np.uint8)
+                    frame = cv2.imdecode(compressed, cv2.IMREAD_COLOR)
+                if frame is None:
+                    return
+                with self.ros_frame_lock:
+                    self.ros_latest_frame = frame
+            except Exception:
+                return
+
+        self.ros_node.create_subscription(topic_cls, topic_name, on_image, 10)
+        self.ros_topic_name = topic_name
+        self.ros_topic_type = topic_type
+        self.backend = "ros2"
+        self.device_label_text = f"Device: ROS 2 topic {topic_name}"
+        self.device_label.configure(text=self.device_label_text)
+        self.status.configure(text=f"Saving to: {self.save_dir} | backend: {self.backend}")
+
+        self.ros_thread = threading.Thread(target=self._spin_ros_executor, daemon=True)
+        self.ros_thread.start()
+
+    def _spin_ros_executor(self):
+        while not self.ros_shutdown_event.is_set():
+            try:
+                if self.ros_executor is None:
+                    return
+                self.ros_executor.spin_once(timeout_sec=0.1)
+            except Exception:
+                return
 
     def _configure_opencv_capture(self, cap):
         # Ask OpenCV to deliver BGR frames even when camera outputs YUYV/MJPG.
         cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS, 30)
 
     def _start_opencv_index(self, idx):
@@ -652,12 +911,30 @@ class RealSenseCameraApp:
         scored = []
         for idx in indices:
             formats = self._v4l2_formats(idx)
-            score = self._format_score(formats)
+            score = self._format_score(formats) + self._opencv_probe_score(idx)
             scored.append((score, idx))
 
         # Highest score first, then lower device index.
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [idx for _, idx in scored]
+
+    def _opencv_probe_score(self, idx):
+        cap = self._open_opencv_capture(idx)
+        if not cap.isOpened():
+            cap.release()
+            return -1000.0
+
+        self._configure_opencv_capture(cap)
+
+        best_score = -1000.0
+        for _ in range(5):
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            best_score = max(best_score, self._frame_color_score(frame))
+
+        cap.release()
+        return best_score
 
     def _v4l2_formats(self, idx):
         try:
